@@ -1,5 +1,7 @@
 # install-appimage
 
+> 🌐 **Idiomas:** 🇧🇷 **Português** | [🇺🇸 English](README.en.md) | [🇪🇸 Español](README.es.md) | [🇨🇳 简体中文](README.zh-CN.md)
+
 Gerenciador CLI em Rust para instalar, atualizar, verificar integridade, diagnosticar, listar e desinstalar **AppImages** no Linux (com foco em **Arch Linux** e **CachyOS**) utilizando integração XDG exclusivamente em nível de usuário (**sem `sudo`**).
 
 ---
@@ -68,7 +70,7 @@ Opcional conforme o ambiente:
 O script `install.sh` detecta automaticamente a arquitetura (`x86_64` / `aarch64`), baixa o tarball estático (`musl`) do GitHub Releases, valida obrigatoriamente o checksum via `SHA256SUMS.txt` e instala o binário, completions (`bash`, `zsh`, `fish`) e manpage em nível de usuário (`~/.local`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/passella/install-appimage/main/install.sh | bash -s -- --repo passella/install-appimage --release
+curl -fsSL https://raw.githubusercontent.com/passella/install-appimage/master/install.sh | bash -s -- --repo passella/install-appimage --release
 ```
 
 Opções principais do `install.sh`:

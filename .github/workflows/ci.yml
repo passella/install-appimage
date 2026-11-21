@@ -338,10 +338,8 @@ jobs:
       - name: Initialize pacman and install Arch test dependencies
         run: |
           set -euo pipefail
-          if [ ! -d /etc/pacman.d/gnupg ]; then
-            pacman-key --init
-            pacman-key --populate archlinux
-          fi
+          pacman-key --init
+          pacman-key --populate archlinux
           pacman -Sy --noconfirm archlinux-keyring
           pacman -Syu --noconfirm rust gcc pkgconf desktop-file-utils gtk-update-icon-cache squashfs-tools python jq
 
@@ -395,9 +393,9 @@ jobs:
           INSTALL_JSON="$("${BIN}" --json "${TMP_ROOT}/ArchSmoke-1.0.AppImage")"
           printf '%s\n' "${INSTALL_JSON}"
           printf '%s\n' "${INSTALL_JSON}" | jq -e '
-            (.cache_outcomes | map(select(.tool == "desktop-file-validate" and .executed == true)) | length == 1) and
-            (.cache_outcomes | map(select(.tool == "update-desktop-database" and .executed == true)) | length == 1) and
-            (.cache_outcomes | map(select(.tool == "gtk-update-icon-cache" and .executed == true)) | length == 1)
+            .warnings == [] and
+            (.cache_outcomes | map(select(.tool == "update-desktop-database" and .executed == true and .detail == "updated")) | length == 1) and
+            (.cache_outcomes | map(select(.tool == "gtk-update-icon-cache" and .executed == true and .detail == "updated")) | length == 1)
           '
 
           desktop-file-validate "${XDG_DATA_HOME}/applications/arch-smoke-app.desktop"
