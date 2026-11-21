@@ -1,0 +1,507 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check-and-test:
+    name: Format, Clippy, Tests & Release Build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate shell scripts (bash -n & shellcheck)
+        run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          }
+          for script in install.sh uninstall.sh; do
+            test -f "${script}"
+            bash -n "${script}"
+          done
+          shellcheck install.sh uninstall.sh
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary and run CLI, BrokenPipe & installer smoke checks
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          BIN="./target/release/install-appimage"
+
+          EXPECTED_VERSION="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as fh:
+              print(tomllib.load(fh)["package"]["version"])
+          PY
+          )"
+          ACTUAL_VERSION="$("${BIN}" --version)"
+          printf '%s\n' "${ACTUAL_VERSION}"
+          test "${ACTUAL_VERSION}" = "install-appimage ${EXPECTED_VERSION}"
+          "${BIN}" --help
+
+          TMP_ROOT="$(mktemp -d)"
+          trap 'rm -rf "${TMP_ROOT}"' EXIT
+
+          "${BIN}" --generate-completion bash > "${TMP_ROOT}/install-appimage.bash"
+          "${BIN}" --generate-completion zsh > "${TMP_ROOT}/_install-appimage"
+          "${BIN}" --generate-completion fish > "${TMP_ROOT}/install-appimage.fish"
+          "${BIN}" --generate-man | gzip -9n > "${TMP_ROOT}/install-appimage.1.gz"
+          test -s "${TMP_ROOT}/install-appimage.bash"
+          test -s "${TMP_ROOT}/_install-appimage"
+          test -s "${TMP_ROOT}/install-appimage.fish"
+          test -s "${TMP_ROOT}/install-appimage.1.gz"
+          bash -n "${TMP_ROOT}/install-appimage.bash"
+          gzip -t "${TMP_ROOT}/install-appimage.1.gz"
+
+          export HOME="${TMP_ROOT}/home"
+          export XDG_DATA_HOME="${TMP_ROOT}/xdg_data"
+          mkdir -p "${HOME}" "${XDG_DATA_HOME}"
+
+          "${BIN}" --doctor
+          "${BIN}" --doctor --json | jq -e 'has("healthy") and has("missing_pacman_packages") and (.checks | length > 0)'
+          "${BIN}" --list
+          "${BIN}" -l --json | jq -e '.apps == []'
+          "${BIN}" --verify
+          "${BIN}" --verify --json | jq -e '.strict == false and .all_ok == true and .total == 0 and .ok_count == 0 and .failed_count == 0 and (.results | length == 0)'
+          "${BIN}" --verify --strict --json | jq -e '.strict == true and .all_ok == true and .total == 0 and .ok_count == 0 and .failed_count == 0 and (.results | length == 0)'
+
+          python3 - <<'PY'
+          import subprocess
+          bin_path = "./target/release/install-appimage"
+          for args in (
+              ["--generate-completion", "bash"],
+              ["--generate-man"],
+              ["--doctor", "--json"],
+          ):
+              proc = subprocess.Popen(
+                  [bin_path, *args],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+              assert proc.stdout is not None and proc.stderr is not None
+              first = proc.stdout.read(16)
+              assert len(first) > 0, f"expected output for {args}"
+              proc.stdout.close()
+              err = proc.stderr.read().decode("utf-8", errors="replace")
+              rc = proc.wait(timeout=10)
+              assert rc == 0, f"expected exit 0 on BrokenPipe for {args}, got {rc}, stderr={err!r}"
+              assert err == "", f"unexpected stderr on BrokenPipe for {args}: {err!r}"
+          PY
+
+          ./install.sh --bin "${BIN}" --prefix "${TMP_ROOT}/prefix"
+          test -x "${TMP_ROOT}/prefix/bin/install-appimage"
+          test -s "${TMP_ROOT}/prefix/share/bash-completion/completions/install-appimage"
+          test -s "${TMP_ROOT}/prefix/share/zsh/site-functions/_install-appimage"
+          test -s "${TMP_ROOT}/prefix/share/fish/vendor_completions.d/install-appimage.fish"
+          test -s "${TMP_ROOT}/prefix/share/man/man1/install-appimage.1.gz"
+          "${TMP_ROOT}/prefix/bin/install-appimage" --version
+          ./uninstall.sh --prefix "${TMP_ROOT}/prefix"
+          test ! -e "${TMP_ROOT}/prefix/bin/install-appimage"
+          test ! -e "${TMP_ROOT}/prefix/share/man/man1/install-appimage.1.gz"
+
+          TAG="v${EXPECTED_VERSION}"
+          TARGET="$(uname -m)-unknown-linux-musl"
+          ASSET_NAME="install-appimage-${TAG}-${TARGET}.tar.gz"
+          SRV_REAL="${TMP_ROOT}/srv_real"
+          SRV_FALLBACK="${TMP_ROOT}/srv_fallback"
+          SRV_BAD_SHA="${TMP_ROOT}/srv_bad_sha"
+          STAGE_REAL="${TMP_ROOT}/stage_real"
+          STAGE_FALLBACK="${TMP_ROOT}/stage_fallback"
+          mkdir -p \
+            "${SRV_REAL}/download/${TAG}" \
+            "${SRV_FALLBACK}/download/${TAG}" \
+            "${SRV_BAD_SHA}/download/${TAG}" \
+            "${STAGE_REAL}/completions" "${STAGE_REAL}/man" \
+            "${STAGE_FALLBACK}/completions" "${STAGE_FALLBACK}/man"
+
+          install -m 0755 "${BIN}" "${STAGE_REAL}/install-appimage"
+          install -m 0644 "${TMP_ROOT}/install-appimage.bash" "${STAGE_REAL}/completions/install-appimage.bash"
+          install -m 0644 "${TMP_ROOT}/_install-appimage" "${STAGE_REAL}/completions/_install-appimage"
+          install -m 0644 "${TMP_ROOT}/install-appimage.fish" "${STAGE_REAL}/completions/install-appimage.fish"
+          install -m 0644 "${TMP_ROOT}/install-appimage.1.gz" "${STAGE_REAL}/man/install-appimage.1.gz"
+          tar -czf "${SRV_REAL}/download/${TAG}/${ASSET_NAME}" -C "${STAGE_REAL}" install-appimage completions man
+          (
+            cd "${SRV_REAL}/download/${TAG}"
+            sha256sum "${ASSET_NAME}" > SHA256SUMS.txt
+          )
+
+          cp "${SRV_REAL}/download/${TAG}/${ASSET_NAME}" "${SRV_BAD_SHA}/download/${TAG}/${ASSET_NAME}"
+          printf '0000000000000000000000000000000000000000000000000000000000000000  %s\n' "${ASSET_NAME}" \
+            > "${SRV_BAD_SHA}/download/${TAG}/SHA256SUMS.txt"
+
+          printf '#!/bin/sh\nexit 1\n' > "${STAGE_FALLBACK}/install-appimage"
+          chmod 0755 "${STAGE_FALLBACK}/install-appimage"
+          install -m 0644 "${TMP_ROOT}/install-appimage.bash" "${STAGE_FALLBACK}/completions/install-appimage.bash"
+          install -m 0644 "${TMP_ROOT}/_install-appimage" "${STAGE_FALLBACK}/completions/_install-appimage"
+          install -m 0644 "${TMP_ROOT}/install-appimage.fish" "${STAGE_FALLBACK}/completions/install-appimage.fish"
+          install -m 0644 "${TMP_ROOT}/install-appimage.1.gz" "${STAGE_FALLBACK}/man/install-appimage.1.gz"
+          tar -czf "${SRV_FALLBACK}/download/${TAG}/${ASSET_NAME}" -C "${STAGE_FALLBACK}" install-appimage completions man
+          (
+            cd "${SRV_FALLBACK}/download/${TAG}"
+            sha256sum "${ASSET_NAME}" > SHA256SUMS.txt
+          )
+
+          export EXPECTED_VERSION TAG TMP_ROOT SRV_REAL SRV_FALLBACK SRV_BAD_SHA
+          python3 - <<'PY'
+          import functools
+          import http.server
+          import os
+          import socketserver
+          import subprocess
+          import threading
+
+          tag = os.environ["TAG"]
+          expected_version = os.environ["EXPECTED_VERSION"]
+          tmp_root = os.environ["TMP_ROOT"]
+
+          class MockReleaseHandler(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == "/latest":
+                      port = self.server.server_address[1]
+                      self.send_response(302)
+                      self.send_header("Location", f"http://127.0.0.1:{port}/tag/{tag}")
+                      self.end_headers()
+                      return
+                  if self.path == f"/tag/{tag}":
+                      self.send_response(200)
+                      self.send_header("Content-Length", "0")
+                      self.end_headers()
+                      return
+                  super().do_GET()
+
+              def do_HEAD(self):
+                  if self.path == "/latest":
+                      port = self.server.server_address[1]
+                      self.send_response(302)
+                      self.send_header("Location", f"http://127.0.0.1:{port}/tag/{tag}")
+                      self.end_headers()
+                      return
+                  if self.path == f"/tag/{tag}":
+                      self.send_response(200)
+                      self.send_header("Content-Length", "0")
+                      self.end_headers()
+                      return
+                  super().do_HEAD()
+
+          def serve_dir(directory):
+              handler = functools.partial(MockReleaseHandler, directory=directory)
+              httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+              port = httpd.server_address[1]
+              thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+              thread.start()
+              return httpd, port
+
+          for label, srv_dir, version_arg, prefix_name, verify_bin in (
+              ("real_pinned", os.environ["SRV_REAL"], tag, "rel_real_pinned", True),
+              ("real_latest", os.environ["SRV_REAL"], "latest", "rel_real_latest", True),
+              ("fallback", os.environ["SRV_FALLBACK"], tag, "rel_fallback", False),
+          ):
+              httpd, port = serve_dir(srv_dir)
+              try:
+                  env = os.environ.copy()
+                  env["INSTALL_APPIMAGE_RELEASE_BASE_URL"] = f"http://127.0.0.1:{port}"
+                  prefix = os.path.join(tmp_root, prefix_name)
+                  subprocess.run(
+                      [
+                          "./install.sh",
+                          "--release",
+                          "--version",
+                          version_arg,
+                          "--prefix",
+                          prefix,
+                      ],
+                      check=True,
+                      env=env,
+                  )
+                  for rel_path in (
+                      "bin/install-appimage",
+                      "share/bash-completion/completions/install-appimage",
+                      "share/zsh/site-functions/_install-appimage",
+                      "share/fish/vendor_completions.d/install-appimage.fish",
+                      "share/man/man1/install-appimage.1.gz",
+                  ):
+                      full_path = os.path.join(prefix, rel_path)
+                      assert os.path.isfile(full_path) and os.path.getsize(full_path) > 0, (
+                          f"[{label}] missing or empty {full_path}"
+                      )
+                  if verify_bin:
+                      ver_out = subprocess.check_output(
+                          [os.path.join(prefix, "bin/install-appimage"), "--version"],
+                          text=True,
+                      ).strip()
+                      assert ver_out == f"install-appimage {expected_version}", (
+                          f"[{label}] unexpected version output: {ver_out!r}"
+                      )
+                  subprocess.run(
+                      ["gzip", "-t", os.path.join(prefix, "share/man/man1/install-appimage.1.gz")],
+                      check=True,
+                  )
+                  subprocess.run(["./uninstall.sh", "--prefix", prefix], check=True)
+                  assert not os.path.exists(os.path.join(prefix, "bin/install-appimage"))
+              finally:
+                  httpd.shutdown()
+                  httpd.server_close()
+
+          for label, srv_dir, version_arg, prefix_name in (
+              ("bad_checksum", os.environ["SRV_BAD_SHA"], tag, "neg_bad_checksum"),
+              ("http_404", os.environ["SRV_REAL"], "v9.9.9", "neg_http_404"),
+          ):
+              httpd, port = serve_dir(srv_dir)
+              try:
+                  env = os.environ.copy()
+                  env["INSTALL_APPIMAGE_RELEASE_BASE_URL"] = f"http://127.0.0.1:{port}"
+                  neg_prefix = os.path.join(tmp_root, prefix_name)
+                  res = subprocess.run(
+                      [
+                          "./install.sh",
+                          "--release",
+                          "--version",
+                          version_arg,
+                          "--prefix",
+                          neg_prefix,
+                      ],
+                      env=env,
+                      capture_output=True,
+                      text=True,
+                  )
+                  assert res.returncode != 0, (
+                      f"[{label}] expected failure, got rc=0, stdout={res.stdout!r}, stderr={res.stderr!r}"
+                  )
+                  assert not os.path.exists(neg_prefix), (
+                      f"[{label}] expected fail-closed without creating {neg_prefix}"
+                  )
+              finally:
+                  httpd.shutdown()
+                  httpd.server_close()
+          PY
+
+  archlinux-smoke:
+    name: Arch Linux Real XDG & Desktop Cache Smoke Tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    container: archlinux@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize pacman and install Arch test dependencies
+        run: |
+          set -euo pipefail
+          if [ ! -d /etc/pacman.d/gnupg ]; then
+            pacman-key --init
+            pacman-key --populate archlinux
+          fi
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm rust gcc pkgconf desktop-file-utils gtk-update-icon-cache squashfs-tools python jq
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: archlinux
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+
+      - name: Run full test suite against real Arch Linux tools
+        run: cargo test --locked
+
+      - name: Run E2E AppImage install, desktop-file-validate, update-desktop-database and strict verify smoke checks
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          BIN="./target/release/install-appimage"
+
+          TMP_ROOT="$(mktemp -d)"
+          trap 'rm -rf "${TMP_ROOT}"' EXIT
+          export HOME="${TMP_ROOT}/home"
+          export XDG_DATA_HOME="${TMP_ROOT}/xdg_data"
+          mkdir -p "${HOME}" "${XDG_DATA_HOME}" "${TMP_ROOT}/appdir/usr/share/icons/hicolor/scalable/apps"
+
+          cat > "${TMP_ROOT}/appdir/arch-smoke.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Arch Smoke App
+          Exec=AppRun %U
+          Icon=arch-smoke
+          Categories=Utility;Development;
+          DESKTOP
+
+          printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#1793d1"/></svg>\n' \
+            > "${TMP_ROOT}/appdir/usr/share/icons/hicolor/scalable/apps/arch-smoke.svg"
+
+          mksquashfs "${TMP_ROOT}/appdir" "${TMP_ROOT}/payload.sqfs" -comp zstd -noappend
+          python3 - "${TMP_ROOT}/payload.sqfs" "${TMP_ROOT}/ArchSmoke-1.0.AppImage" <<'PY'
+          import sys
+          sqfs_path, out_path = sys.argv[1], sys.argv[2]
+          elf = bytearray(64)
+          elf[0:4] = b"\x7fELF"
+          elf[4], elf[5], elf[6] = 2, 1, 1
+          elf[8:11] = b"AI\x02"
+          with open(out_path, "wb") as out_fh:
+              out_fh.write(elf)
+              with open(sqfs_path, "rb") as sq_fh:
+                  out_fh.write(sq_fh.read())
+          PY
+
+          INSTALL_JSON="$("${BIN}" --json "${TMP_ROOT}/ArchSmoke-1.0.AppImage")"
+          printf '%s\n' "${INSTALL_JSON}"
+          printf '%s\n' "${INSTALL_JSON}" | jq -e '
+            (.cache_outcomes | map(select(.tool == "desktop-file-validate" and .executed == true)) | length == 1) and
+            (.cache_outcomes | map(select(.tool == "update-desktop-database" and .executed == true)) | length == 1) and
+            (.cache_outcomes | map(select(.tool == "gtk-update-icon-cache" and .executed == true)) | length == 1)
+          '
+
+          desktop-file-validate "${XDG_DATA_HOME}/applications/arch-smoke-app.desktop"
+          update-desktop-database "${XDG_DATA_HOME}/applications"
+
+          "${BIN}" --verify --strict --json | jq -e '.strict == true and .all_ok == true and .total == 1 and .ok_count == 1 and .failed_count == 0'
+          "${BIN}" -u arch-smoke-app --json | jq -e '.mode == "uninstall" and .app.slug == "arch-smoke-app"'
+          "${BIN}" --verify --strict --json | jq -e '.strict == true and .all_ok == true and .total == 0 and .ok_count == 0 and .failed_count == 0'
+
+  security-audit:
+    name: Security & Dependency Policy Audit (cargo-audit & cargo-deny)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install and run cargo-audit and cargo-deny
+        env:
+          CARGO_AUDIT_VERSION: "0.23.0"
+          CARGO_AUDIT_SHA256: "4f01c74ed84b2dffd0b1d37012a62cdf2a92c96e25bdf8eec7fcc0d4d3eb7811"
+          CARGO_DENY_VERSION: "0.22.0"
+          CARGO_DENY_SHA256: "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+        run: |
+          set -euo pipefail
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TMP_DIR}"' EXIT
+
+          AUDIT_ARCHIVE="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}.tgz"
+          AUDIT_URL="https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/${AUDIT_ARCHIVE}"
+          curl -fsSL --retry 3 -o "${TMP_DIR}/${AUDIT_ARCHIVE}" "${AUDIT_URL}"
+          printf '%s  %s/%s\n' "${CARGO_AUDIT_SHA256}" "${TMP_DIR}" "${AUDIT_ARCHIVE}" | sha256sum -c -
+          tar -xzf "${TMP_DIR}/${AUDIT_ARCHIVE}" -C "${TMP_DIR}"
+          AUDIT_BIN="${TMP_DIR}/cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}/cargo-audit"
+          "${AUDIT_BIN}" audit --file Cargo.lock --deny warnings
+          "${AUDIT_BIN}" audit --file fuzz/Cargo.lock --deny warnings
+
+          DENY_ARCHIVE="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          DENY_URL="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${DENY_ARCHIVE}"
+          curl -fsSL --retry 3 -o "${TMP_DIR}/${DENY_ARCHIVE}" "${DENY_URL}"
+          printf '%s  %s/%s\n' "${CARGO_DENY_SHA256}" "${TMP_DIR}" "${DENY_ARCHIVE}" | sha256sum -c -
+          tar -xzf "${TMP_DIR}/${DENY_ARCHIVE}" -C "${TMP_DIR}"
+          DENY_BIN="${TMP_DIR}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+          "${DENY_BIN}" --manifest-path Cargo.toml --locked --all-features check
+          "${DENY_BIN}" --manifest-path fuzz/Cargo.toml --config deny.toml --locked check
+
+  workflow-audit:
+    name: Workflow Security Audit (zizmor)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor workflow audit
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          inputs: .github/workflows
+          advanced-security: false
+          online-audits: true
+          persona: pedantic
+
+  fuzz-smoke:
+    name: Weekly Cargo Fuzz Smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable and nightly toolchains
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          cargo +stable install --locked cargo-fuzz
+
+      - name: Run fuzz smoke targets
+        run: |
+          set -euo pipefail
+          for target in elf desktop_entry svg_sanitizer iso9660; do
+            echo "::group::Fuzzing ${target}"
+            if [ -d "fuzz/corpus/${target}" ]; then
+              cargo +nightly fuzz run "${target}" "fuzz/corpus/${target}" -- -max_total_time=30
+            else
+              cargo +nightly fuzz run "${target}" -- -max_total_time=30
+            fi
+            echo "::endgroup::"
+          done

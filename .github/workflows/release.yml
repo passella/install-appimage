@@ -1,0 +1,554 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Version Parity, Format, Clippy, Audit & Tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate Cargo.toml SemVer and tag parity
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+
+          SEMVER_RE = re.compile(
+              r"\A(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+              r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?\Z",
+              re.ASCII,
+          )
+
+          with open("Cargo.toml", "rb") as fh:
+              cargo = tomllib.load(fh)
+
+          pkg = cargo.get("package", {})
+          name = pkg.get("name")
+          if name != "install-appimage":
+              print(f"Error: expected Cargo.toml package.name 'install-appimage', got '{name}'.", file=sys.stderr)
+              sys.exit(1)
+
+          version = pkg.get("version")
+          match = SEMVER_RE.fullmatch(version) if isinstance(version, str) else None
+          if match is None:
+              print(f"Error: Cargo.toml package.version '{version}' is not valid SemVer 2.0.0.", file=sys.stderr)
+              sys.exit(1)
+
+          expected_tag = f"v{version}"
+          if "\r" in expected_tag or "\n" in expected_tag:
+              print("Error: resolved release tag contains invalid newline characters.", file=sys.stderr)
+              sys.exit(1)
+
+          is_prerelease = "true" if match.group(4) is not None else "false"
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          ref_name = os.environ.get("REF_NAME", "")
+          ref_type = os.environ.get("REF_TYPE", "")
+
+          if event_name == "push":
+              if ref_type == "tag":
+                  if ref_name != expected_tag:
+                      print(
+                          f"Error: tag '{ref_name}' does not match Cargo.toml version '{expected_tag}'.",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+              elif ref_type != "branch" or ref_name not in ("main", "master"):
+                  print(
+                      f"Error: push release requires main/master branch or matching SemVer tag (got ref_type='{ref_type}', ref='{ref_name}').",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          elif event_name == "workflow_dispatch":
+              if ref_type != "branch" or ref_name not in ("main", "master"):
+                  print(
+                      f"Error: workflow_dispatch release requires main/master branch (got ref_type='{ref_type}', ref='{ref_name}').",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          else:
+              print(f"Error: unsupported event '{event_name}' for release workflow.", file=sys.stderr)
+              sys.exit(1)
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+              fh.write(f"tag={expected_tag}\n")
+              fh.write(f"is_prerelease={is_prerelease}\n")
+
+          print(f"Resolved release version={version}, tag={expected_tag}, prerelease={is_prerelease}, event={event_name}")
+          PY
+
+      - name: Verify commit is an ancestor of default branch
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/heads/${DEFAULT_BRANCH}...${GITHUB_SHA}" --jq '.status')"
+          case "${STATUS}" in
+            identical|behind)
+              echo "Verified ${GITHUB_SHA} ancestry on ${DEFAULT_BRANCH} (compare status=${STATUS})."
+              ;;
+            *)
+              echo "Error: commit ${GITHUB_SHA} is not an ancestor of ${DEFAULT_BRANCH} (compare status=${STATUS})." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Validate shell scripts (bash -n & shellcheck)
+        run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          }
+          for script in install.sh uninstall.sh; do
+            test -f "${script}"
+            bash -n "${script}"
+          done
+          shellcheck install.sh uninstall.sh
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Install and run cargo-audit and cargo-deny
+        env:
+          CARGO_AUDIT_VERSION: "0.23.0"
+          CARGO_AUDIT_SHA256: "4f01c74ed84b2dffd0b1d37012a62cdf2a92c96e25bdf8eec7fcc0d4d3eb7811"
+          CARGO_DENY_VERSION: "0.22.0"
+          CARGO_DENY_SHA256: "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+        run: |
+          set -euo pipefail
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TMP_DIR}"' EXIT
+
+          AUDIT_ARCHIVE="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}.tgz"
+          AUDIT_URL="https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/${AUDIT_ARCHIVE}"
+          curl -fsSL --retry 3 -o "${TMP_DIR}/${AUDIT_ARCHIVE}" "${AUDIT_URL}"
+          printf '%s  %s/%s\n' "${CARGO_AUDIT_SHA256}" "${TMP_DIR}" "${AUDIT_ARCHIVE}" | sha256sum -c -
+          tar -xzf "${TMP_DIR}/${AUDIT_ARCHIVE}" -C "${TMP_DIR}"
+          AUDIT_BIN="${TMP_DIR}/cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}/cargo-audit"
+          "${AUDIT_BIN}" audit --file Cargo.lock --deny warnings
+          "${AUDIT_BIN}" audit --file fuzz/Cargo.lock --deny warnings
+
+          DENY_ARCHIVE="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          DENY_URL="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${DENY_ARCHIVE}"
+          curl -fsSL --retry 3 -o "${TMP_DIR}/${DENY_ARCHIVE}" "${DENY_URL}"
+          printf '%s  %s/%s\n' "${CARGO_DENY_SHA256}" "${TMP_DIR}" "${DENY_ARCHIVE}" | sha256sum -c -
+          tar -xzf "${TMP_DIR}/${DENY_ARCHIVE}" -C "${TMP_DIR}"
+          DENY_BIN="${TMP_DIR}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+          "${DENY_BIN}" --manifest-path Cargo.toml --locked --all-features check
+          "${DENY_BIN}" --manifest-path fuzz/Cargo.toml --config deny.toml --locked check
+
+  build:
+    name: Build Static Musl (${{ matrix.target }})
+    needs: [check]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            bin_name: install-appimage-linux-x86_64
+            cc_env: CC_x86_64_unknown_linux_musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            bin_name: install-appimage-linux-aarch64
+            cc_env: CC_aarch64_unknown_linux_musl
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install musl toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain with musl target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target "${TARGET}"
+          rustup default stable
+
+      - name: Build static musl release binary and package assets
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BIN_NAME: ${{ matrix.bin_name }}
+          CC_ENV_VAR: ${{ matrix.cc_env }}
+        run: |
+          set -euo pipefail
+          export "${CC_ENV_VAR}=musl-gcc"
+          export RUSTFLAGS="-C target-feature=+crt-static"
+
+          cargo build --release --locked --target "${TARGET}"
+
+          BIN_PATH="target/${TARGET}/release/install-appimage"
+          strip "${BIN_PATH}"
+
+          file "${BIN_PATH}"
+          file "${BIN_PATH}" | grep -iE 'static|statically'
+          "${BIN_PATH}" --version
+
+          rm -rf dist staging
+          mkdir -p dist staging/completions staging/man
+
+          "${BIN_PATH}" --generate-completion bash > staging/completions/install-appimage.bash
+          "${BIN_PATH}" --generate-completion zsh > staging/completions/_install-appimage
+          "${BIN_PATH}" --generate-completion fish > staging/completions/install-appimage.fish
+          "${BIN_PATH}" --generate-man | gzip -9n > staging/man/install-appimage.1.gz
+          test -s staging/completions/install-appimage.bash
+          test -s staging/completions/_install-appimage
+          test -s staging/completions/install-appimage.fish
+          test -s staging/man/install-appimage.1.gz
+          gzip -t staging/man/install-appimage.1.gz
+
+          install -m 0755 "${BIN_PATH}" staging/install-appimage
+          install -m 0644 README.md staging/README.md
+          install -m 0644 LICENSE staging/LICENSE
+          install -m 0644 CHANGELOG.md staging/CHANGELOG.md
+          tar -czf "dist/install-appimage-${TAG}-${TARGET}.tar.gz" -C staging install-appimage README.md LICENSE CHANGELOG.md completions man
+
+          if [ "${TARGET}" = "x86_64-unknown-linux-musl" ]; then
+            install -m 0644 staging/completions/install-appimage.bash dist/install-appimage.bash
+            install -m 0644 staging/completions/_install-appimage dist/_install-appimage
+            install -m 0644 staging/completions/install-appimage.fish dist/install-appimage.fish
+            install -m 0644 staging/man/install-appimage.1.gz dist/install-appimage.1.gz
+          fi
+
+          install -m 0755 "${BIN_PATH}" "dist/${BIN_NAME}"
+          ls -lh dist/
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke Test Static Musl (${{ matrix.target }})
+    needs: [check, build]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            bin_name: install-appimage-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            bin_name: install-appimage-linux-aarch64
+
+    steps:
+      - name: Download musl artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist
+
+      - name: Run isolated smoke tests on static binary and tarball
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          BIN_NAME: ${{ matrix.bin_name }}
+        run: |
+          set -euo pipefail
+          TMP_ROOT="$(mktemp -d)"
+          trap 'rm -rf "${TMP_ROOT}"' EXIT
+
+          export HOME="${TMP_ROOT}/home"
+          export XDG_DATA_HOME="${TMP_ROOT}/xdg_data"
+          mkdir -p "${HOME}" "${XDG_DATA_HOME}"
+
+          BIN="dist/${BIN_NAME}"
+          chmod 0755 "${BIN}"
+          file "${BIN}" | grep -iE 'static|statically'
+
+          ACTUAL_VERSION="$("${BIN}" --version)"
+          printf '%s\n' "${ACTUAL_VERSION}"
+          test "${ACTUAL_VERSION}" = "install-appimage ${VERSION}"
+          "${BIN}" --help
+          "${BIN}" --doctor
+          "${BIN}" --doctor --json | jq -e 'has("healthy") and has("missing_pacman_packages") and (.checks | length > 0)'
+          "${BIN}" --list
+          "${BIN}" -l --json | jq -e '.apps == []'
+          "${BIN}" --verify
+          "${BIN}" --verify --json | jq -e '.strict == false and .all_ok == true and .total == 0 and .ok_count == 0 and .failed_count == 0 and (.results | length == 0)'
+          "${BIN}" --verify --strict --json | jq -e '.strict == true and .all_ok == true and .total == 0 and .ok_count == 0 and .failed_count == 0 and (.results | length == 0)'
+
+          TAR_DIR="${TMP_ROOT}/tar"
+          mkdir -p "${TAR_DIR}"
+          tar -xzf "dist/install-appimage-${TAG}-${TARGET}.tar.gz" -C "${TAR_DIR}"
+          test -x "${TAR_DIR}/install-appimage"
+          test -f "${TAR_DIR}/README.md"
+          test -f "${TAR_DIR}/LICENSE"
+          test -f "${TAR_DIR}/CHANGELOG.md"
+          test -s "${TAR_DIR}/completions/install-appimage.bash"
+          test -s "${TAR_DIR}/completions/_install-appimage"
+          test -s "${TAR_DIR}/completions/install-appimage.fish"
+          test -s "${TAR_DIR}/man/install-appimage.1.gz"
+          gzip -t "${TAR_DIR}/man/install-appimage.1.gz"
+
+          TAR_VERSION="$("${TAR_DIR}/install-appimage" --version)"
+          test "${TAR_VERSION}" = "install-appimage ${VERSION}"
+          "${TAR_DIR}/install-appimage" --doctor --json | jq -e 'has("healthy")'
+          "${TAR_DIR}/install-appimage" --verify --strict --json | jq -e '.strict == true and .all_ok == true'
+
+          if [ "${TARGET}" = "x86_64-unknown-linux-musl" ]; then
+            test -s dist/install-appimage.bash
+            test -s dist/_install-appimage
+            test -s dist/install-appimage.fish
+            test -s dist/install-appimage.1.gz
+            gzip -t dist/install-appimage.1.gz
+          fi
+
+  publish:
+    name: Publish GitHub Release
+    needs: [check, build, smoke]
+    if: (github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write # create/update the GitHub Release and upload assets
+      pull-requests: read # read PR metadata for release notes
+      id-token: write # OIDC token for build provenance attestation
+      attestations: write # persist build provenance attestations
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate and verify SHA256SUMS.txt
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              "install-appimage-${TAG}-x86_64-unknown-linux-musl.tar.gz" \
+              "install-appimage-${TAG}-aarch64-unknown-linux-musl.tar.gz" \
+              "install-appimage-linux-x86_64" \
+              "install-appimage-linux-aarch64" \
+              "install-appimage.bash" \
+              "_install-appimage" \
+              "install-appimage.fish" \
+              "install-appimage.1.gz" \
+              > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+          ls -lh dist/
+          cat dist/SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Generate release notes
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_JSON_PATH="$(mktemp "${RUNNER_TEMP}/pr.XXXXXX.json")"
+          trap 'rm -f "${PR_JSON_PATH}"' EXIT
+          NOTES_PATH="$(mktemp "${RUNNER_TEMP}/release-notes.XXXXXX.md")"
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" > "${PR_JSON_PATH}" || true
+          export PR_JSON_PATH NOTES_PATH
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          pr_json_path = os.environ["PR_JSON_PATH"]
+          notes_path = os.environ["NOTES_PATH"]
+          notes = ""
+
+          if os.path.exists(pr_json_path) and os.path.getsize(pr_json_path) > 0:
+              try:
+                  with open(pr_json_path, "r", encoding="utf-8") as fh:
+                      data = json.load(fh)
+                  if isinstance(data, list):
+                      merged = [p for p in data if p.get("merged_at")]
+                      pr = merged[0] if merged else (data[0] if data else None)
+                  elif isinstance(data, dict):
+                      pr = data
+                  else:
+                      pr = None
+                  if pr:
+                      title = (pr.get("title") or "").strip()
+                      body = (pr.get("body") or "").strip()
+                      if body:
+                          notes = f"## {title}\n\n{body}\n" if title else f"{body}\n"
+              except Exception:
+                  notes = ""
+
+          if not notes.strip():
+              notes = subprocess.check_output(
+                  ["git", "log", "-1", "--pretty=%B"],
+                  text=True,
+              )
+
+          with open(notes_path, "w", encoding="utf-8") as fh:
+              fh.write(notes)
+          PY
+
+          printf 'notes_file=%s\n' "${NOTES_PATH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.check.outputs.is_prerelease }}
+          REF_TYPE: ${{ github.ref_type }}
+          RELEASE_NOTES_FILE: ${{ steps.release_notes.outputs.notes_file }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "${RELEASE_NOTES_FILE}"' EXIT
+          ENCODED_TAG="$(jq -rn --arg v "${TAG}" '$v|@uri')"
+          TAG_SHA=""
+          if REF_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ENCODED_TAG}" 2>&1)"; then
+            OBJ_TYPE="$(printf '%s' "${REF_JSON}" | jq -r --arg r "refs/tags/${TAG}" 'if type == "array" then ([.[] | select(.ref == $r)][0].object.type // "") elif .ref == $r then (.object.type // "") else "" end')"
+            OBJ_SHA="$(printf '%s' "${REF_JSON}" | jq -r --arg r "refs/tags/${TAG}" 'if type == "array" then ([.[] | select(.ref == $r)][0].object.sha // "") elif .ref == $r then (.object.sha // "") else "" end')"
+            if [ -z "${OBJ_TYPE}" ] || [ -z "${OBJ_SHA}" ]; then
+              if [ "${REF_TYPE}" = "tag" ]; then
+                echo "Error: remote tag ref 'refs/tags/${TAG}' was not found." >&2
+                exit 1
+              fi
+            else
+              DEPTH=0
+              while [ "${OBJ_TYPE}" = "tag" ]; do
+                DEPTH=$((DEPTH + 1))
+                if [ "${DEPTH}" -gt 8 ]; then
+                  echo "Error: annotated tag dereference depth exceeded for '${TAG}'." >&2
+                  exit 1
+                fi
+                TAG_OBJ_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${OBJ_SHA}")"
+                OBJ_TYPE="$(printf '%s' "${TAG_OBJ_JSON}" | jq -r '.object.type // ""')"
+                OBJ_SHA="$(printf '%s' "${TAG_OBJ_JSON}" | jq -r '.object.sha // ""')"
+              done
+              if [ "${OBJ_TYPE}" != "commit" ] || [ -z "${OBJ_SHA}" ]; then
+                echo "Error: remote tag '${TAG}' resolved to unsupported object type '${OBJ_TYPE}'." >&2
+                exit 1
+              fi
+              TAG_SHA="${OBJ_SHA}"
+            fi
+          elif [ "${REF_TYPE}" = "tag" ]; then
+            echo "Error: failed to resolve remote ref for tag '${TAG}': ${REF_JSON}" >&2
+            exit 1
+          elif ! printf '%s' "${REF_JSON}" | grep -q 'HTTP 404'; then
+            echo "Error: failed to query remote ref for tag '${TAG}': ${REF_JSON}" >&2
+            exit 1
+          fi
+
+          if [ "${REF_TYPE}" = "tag" ] && [ "${TAG_SHA}" != "${GITHUB_SHA}" ]; then
+            echo "Error: remote tag '${TAG}' points to '${TAG_SHA}', expected '${GITHUB_SHA}'." >&2
+            exit 1
+          fi
+
+          RELEASE_ARGS=(
+            "${TAG}"
+            dist/*
+            --title "${TAG}"
+            --notes-file "${RELEASE_NOTES_FILE}"
+            --target "${GITHUB_SHA}"
+          )
+          if [ "${REF_TYPE}" = "tag" ]; then
+            RELEASE_ARGS+=(--verify-tag)
+          fi
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            RELEASE_ARGS+=(--prerelease)
+          fi
+
+          if gh release view "${TAG}" &>/dev/null; then
+            if [ "${REF_TYPE}" = "tag" ]; then
+              gh release delete "${TAG}" --yes || true
+            else
+              gh release delete "${TAG}" --yes --cleanup-tag || true
+            fi
+          fi
+          if [ "${REF_TYPE}" != "tag" ] && [ -n "${TAG_SHA}" ]; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${ENCODED_TAG}" &>/dev/null || true
+          fi
+          gh release create "${RELEASE_ARGS[@]}"

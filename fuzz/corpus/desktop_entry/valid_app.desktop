@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Demo App
+Comment=Fast desktop notes
+Exec=AppRun %U
+Icon=demo
+Categories=Utility;Network;
+MimeType=text/plain;x-scheme-handler/demo;
+Keywords=notes;markdown;
+X-AppImage-Version=1.0.0

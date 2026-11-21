@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Audio Mixer
+Exec=AppRun %f
+Categories=Utility;Audio;Video;Network;Utility;
+Icon=mixer

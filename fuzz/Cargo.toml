@@ -1,0 +1,45 @@
+[package]
+name = "install-appimage-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.install-appimage]
+path = ".."
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desktop_entry"
+path = "fuzz_targets/desktop_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svg_sanitizer"
+path = "fuzz_targets/svg_sanitizer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iso9660"
+path = "fuzz_targets/iso9660.rs"
+test = false
+doc = false
+bench = false

