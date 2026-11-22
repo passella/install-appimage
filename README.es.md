@@ -160,7 +160,7 @@ install-appimage [OPCIONES] [APPIMAGE]
 | `--generate-completion <SHELL>` | Imprime el script de autocompletado para `<SHELL>` (`bash`, `zsh`, `fish`, `elvish`, `powershell`) en `stdout`. |
 | `--generate-man` | Imprime la página de manual en formato `roff` en `stdout`. |
 | `-h`, `--help` | Muestra la ayuda completa de la CLI. |
-| `-V`, `--version` | Muestra la versión de la herramienta (`0.2.0`). |
+| `-V`, `--version` | Muestra la versión de la herramienta (`0.2.1`). |
 
 ### Ejemplos prácticos
 

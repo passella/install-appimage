@@ -160,7 +160,7 @@ install-appimage [选项] [APPIMAGE]
 | `--generate-completion <SHELL>` | 向 `stdout` 打印适用于 `<SHELL>`（`bash`、`zsh`、`fish`、`elvish`、`powershell`）的自动补全脚本。 |
 | `--generate-man` | 向 `stdout` 打印 `roff` 格式的手册页。 |
 | `-h`, `--help` | 显示完整的 CLI 帮助信息。 |
-| `-V`, `--version` | 显示工具版本（`0.2.0`）。 |
+| `-V`, `--version` | 显示工具版本（`0.2.1`）。 |
 
 ### 实用示例
 

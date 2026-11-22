@@ -602,7 +602,9 @@ where
 
     if let Some(raw_icon) = icon_key {
         let trimmed = raw_icon.trim();
-        if let Ok(rel) = normalize_archive_entry_path(trimmed) {
+        if let Ok(rel) = normalize_archive_entry_path(trimmed)
+            && has_supported_icon_extension(&rel)
+        {
             candidate_paths.push(rel);
         }
         if let Some(stem) = extract_safe_icon_stem(trimmed) {
@@ -612,7 +614,7 @@ where
                 let Some(fname) = path.file_name().and_then(|f| f.to_str()) else {
                     continue;
                 };
-                if fname != png_name && fname != svg_name && fname != stem {
+                if fname != png_name && fname != svg_name {
                     continue;
                 }
                 if path.components().count() == 1
@@ -647,13 +649,13 @@ where
 
         let remaining_budget = MAX_TOTAL_EXTRACTED_BYTES.saturating_sub(*total_extracted_bytes);
         if remaining_budget == 0 {
-            return Err(DomainError::ResourceLimitExceeded {
-                resource: "total extracted AppImage metadata bytes".to_string(),
-                limit: MAX_TOTAL_EXTRACTED_BYTES,
-                context: resolved.display().to_string(),
-            });
+            break;
         }
-        let bytes = read_handle(handle, MAX_ICON_BYTES.min(remaining_budget))?;
+        let bytes = match read_handle(handle, MAX_ICON_BYTES.min(remaining_budget)) {
+            Ok(bytes) => bytes,
+            Err(DomainError::ResourceLimitExceeded { .. }) => continue,
+            Err(err) => return Err(err),
+        };
         *total_extracted_bytes = total_extracted_bytes.saturating_add(bytes.len() as u64);
         if let Some(icon) = classify_icon_bytes(&resolved, bytes) {
             extracted.push(icon);
@@ -661,6 +663,12 @@ where
     }
 
     Ok(extracted)
+}
+
+fn has_supported_icon_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("svg"))
 }
 
 fn classify_icon_bytes(path: &Path, bytes: Vec<u8>) -> Option<ExtractedIcon> {
@@ -912,9 +920,28 @@ pub fn resolve_trusted_executable(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
-    use super::{extract_hicolor_size_dir, extract_safe_icon_stem, parse_png_dimensions};
+    use super::{
+        ArchiveIndex, MAX_ICON_BYTES, MAX_TOTAL_EXTRACTED_BYTES, PayloadHandle, VirtualNode,
+        extract_hicolor_size_dir, extract_icons, extract_safe_icon_stem,
+        has_supported_icon_extension, parse_png_dimensions,
+    };
+    use crate::domain::error::DomainError;
+    use crate::domain::models::IconFormat;
+
+    fn sample_png(dim: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&dim.to_be_bytes());
+        png.extend_from_slice(&dim.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        png
+    }
 
     #[test]
     fn validates_png_and_hicolor_icon_paths() {
@@ -941,5 +968,154 @@ mod tests {
             Some("obsidian")
         );
         assert_eq!(extract_safe_icon_stem(".."), None);
+
+        assert!(has_supported_icon_extension(Path::new("bruno.png")));
+        assert!(has_supported_icon_extension(Path::new("BRUNO.PNG")));
+        assert!(has_supported_icon_extension(Path::new(
+            "usr/share/icons/bruno.svg"
+        )));
+        assert!(has_supported_icon_extension(Path::new("BRUNO.SVG")));
+        assert!(!has_supported_icon_extension(Path::new("bruno")));
+        assert!(!has_supported_icon_extension(Path::new("bruno.xpm")));
+        assert!(!has_supported_icon_extension(Path::new(".DirIcon")));
+    }
+
+    #[test]
+    fn extract_icons_skips_extensionless_root_binary_without_probing_or_budget_loss() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            PathBuf::from("bruno"),
+            VirtualNode::File(PayloadHandle::Iso {
+                size: 4096,
+                extents: &[],
+            }),
+        );
+        nodes.insert(
+            PathBuf::from("bruno.png"),
+            VirtualNode::File(PayloadHandle::Iso {
+                size: 100,
+                extents: &[],
+            }),
+        );
+        nodes.insert(
+            PathBuf::from(".DirIcon"),
+            VirtualNode::Symlink("bruno.png".to_string()),
+        );
+        let index = ArchiveIndex { nodes };
+
+        let probed_sizes: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+        let expected_png = sample_png(256);
+        let mut total_bytes = 0u64;
+
+        let icons = extract_icons(
+            &index,
+            Some("bruno"),
+            &|handle, _max_bytes| {
+                let PayloadHandle::Iso { size, .. } = handle else {
+                    panic!("unexpected handle");
+                };
+                probed_sizes.borrow_mut().push(*size);
+                if *size == 4096 {
+                    panic!("extensionless root binary must never be probed");
+                }
+                Ok(expected_png.clone())
+            },
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(*probed_sizes.borrow(), vec![100]);
+        assert_eq!(total_bytes, expected_png.len() as u64);
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].format, IconFormat::Png);
+        assert_eq!(icons[0].size_dir, "256x256");
+    }
+
+    #[test]
+    fn extract_icons_skips_oversized_icon_candidates_and_keeps_valid_smaller_icon() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            PathBuf::from("usr/share/icons/hicolor/512x512/apps/bruno.png"),
+            VirtualNode::File(PayloadHandle::Iso {
+                size: MAX_ICON_BYTES + 1,
+                extents: &[],
+            }),
+        );
+        nodes.insert(
+            PathBuf::from("usr/share/icons/hicolor/128x128/apps/bruno.png"),
+            VirtualNode::File(PayloadHandle::Iso {
+                size: 128,
+                extents: &[],
+            }),
+        );
+        nodes.insert(
+            PathBuf::from(".DirIcon"),
+            VirtualNode::Symlink("usr/share/icons/hicolor/512x512/apps/bruno.png".to_string()),
+        );
+        let index = ArchiveIndex { nodes };
+
+        let mut total_bytes = 0u64;
+        let expected_png = sample_png(128);
+        let icons = extract_icons(
+            &index,
+            Some("bruno"),
+            &|handle, max_bytes| {
+                let PayloadHandle::Iso { size, .. } = handle else {
+                    panic!("unexpected handle");
+                };
+                if *size > max_bytes {
+                    return Err(DomainError::ResourceLimitExceeded {
+                        resource: "ISO9660 file entry".to_string(),
+                        limit: max_bytes,
+                        context: format!("declared size {size} bytes"),
+                    });
+                }
+                Ok(expected_png.clone())
+            },
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].size_dir, "128x128");
+        assert_eq!(total_bytes, expected_png.len() as u64);
+    }
+
+    #[test]
+    fn extract_icons_breaks_on_exhausted_budget_and_propagates_non_limit_errors() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            PathBuf::from("app.png"),
+            VirtualNode::File(PayloadHandle::Iso {
+                size: 64,
+                extents: &[],
+            }),
+        );
+        let index = ArchiveIndex { nodes };
+
+        let mut exhausted_budget = MAX_TOTAL_EXTRACTED_BYTES;
+        let empty = extract_icons(
+            &index,
+            Some("app"),
+            &|_handle, _max_bytes| panic!("must not read when remaining_budget == 0"),
+            &mut exhausted_budget,
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+
+        let mut zero_used = 0u64;
+        let err = extract_icons(
+            &index,
+            Some("app"),
+            &|_handle, _max_bytes| {
+                Err(DomainError::Io {
+                    context: "reading icon".to_string(),
+                    reason: "disk error".to_string(),
+                })
+            },
+            &mut zero_used,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DomainError::Io { .. }));
     }
 }

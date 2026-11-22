@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-22
+
+### Fixed
+
+- Restricted direct and stem-based icon candidate matching in `extract_icons` to `.png`/`.svg` filenames (preserving `.DirIcon` fallback), preventing extensionless desktop `Icon=<app>` keys (e.g., `Icon=bruno` matching a 201 MB root ELF binary) from probing application binaries as icons.
+- Made oversized icon candidate handling resilient by skipping individual `ResourceLimitExceeded` reads (e.g., `> 8 MiB` icon entries or exhausted remaining budget) instead of aborting AppImage metadata extraction when valid smaller icons exist.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

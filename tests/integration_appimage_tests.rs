@@ -1386,3 +1386,115 @@ fn cli_e2e_migrates_v1_registry_to_v2_and_normalizes_env_paths() {
     assert_eq!(fs::read(&layout.registry_path).unwrap(), v1_bytes);
     fs::write(&icon_path, icon_backup).unwrap();
 }
+
+#[test]
+fn extracts_icons_ignoring_extensionless_root_binary_and_oversized_icon_candidates() {
+    let tmp = TempDir::new().unwrap();
+    let extractor = StaticAppImageExtractor;
+
+    let oversized_binary_app = tmp.path().join("BrunoStyle-4.3.0.AppImage");
+    build_squashfs_appimage(&oversized_binary_app, Compressor::Gzip, |w| {
+        let hdr = NodeHeader::default();
+        let desktop = b"[Desktop Entry]\n\
+            Type=Application\n\
+            Name=Bruno\n\
+            Exec=AppRun --no-sandbox %U\n\
+            Icon=bruno\n\
+            Categories=Development;\n\
+            X-AppImage-Version=4.3.0\n";
+        w.push_file(Cursor::new(desktop), "bruno.desktop", hdr)
+            .unwrap();
+        w.push_file(Cursor::new(vec![0u8; 8 * 1024 * 1024 + 1]), "bruno", hdr)
+            .unwrap();
+        w.push_dir_all("usr/share/icons/hicolor/128x128/apps", hdr)
+            .unwrap();
+        w.push_dir_all("usr/share/icons/hicolor/256x256/apps", hdr)
+            .unwrap();
+        w.push_file(
+            Cursor::new(minimal_256_png()),
+            "usr/share/icons/hicolor/128x128/apps/bruno.png",
+            hdr,
+        )
+        .unwrap();
+        w.push_file(
+            Cursor::new(minimal_256_png()),
+            "usr/share/icons/hicolor/256x256/apps/bruno.png",
+            hdr,
+        )
+        .unwrap();
+        w.push_symlink(
+            "usr/share/icons/hicolor/256x256/apps/bruno.png",
+            ".DirIcon",
+            hdr,
+        )
+        .unwrap();
+    });
+
+    let inspected_bruno = extractor
+        .inspect_and_extract(&oversized_binary_app, None)
+        .unwrap();
+    assert_eq!(inspected_bruno.metadata.app_name, "Bruno");
+    assert_eq!(inspected_bruno.metadata.icons.len(), 2);
+
+    let small_binary_app = tmp.path().join("SmallBin-1.0.0.AppImage");
+    build_squashfs_appimage(&small_binary_app, Compressor::Gzip, |w| {
+        let hdr = NodeHeader::default();
+        let desktop = b"[Desktop Entry]\n\
+            Type=Application\n\
+            Name=SmallApp\n\
+            Exec=AppRun\n\
+            Icon=smallapp\n";
+        w.push_file(Cursor::new(desktop), "smallapp.desktop", hdr)
+            .unwrap();
+        w.push_file(
+            Cursor::new(vec![0x7f, b'E', b'L', b'F', 0, 0]),
+            "smallapp",
+            hdr,
+        )
+        .unwrap();
+        w.push_file(Cursor::new(minimal_256_png()), "smallapp.png", hdr)
+            .unwrap();
+        w.push_symlink("smallapp.png", ".DirIcon", hdr).unwrap();
+    });
+
+    let inspected_small = extractor
+        .inspect_and_extract(&small_binary_app, None)
+        .unwrap();
+    assert_eq!(inspected_small.metadata.app_name, "SmallApp");
+    assert_eq!(inspected_small.metadata.icons.len(), 1);
+    assert_eq!(inspected_small.metadata.icons[0].size_dir, "256x256");
+
+    let oversized_icon_app = tmp.path().join("BigIcon-1.0.0.AppImage");
+    build_squashfs_appimage(&oversized_icon_app, Compressor::Gzip, |w| {
+        let hdr = NodeHeader::default();
+        let desktop = b"[Desktop Entry]\n\
+            Type=Application\n\
+            Name=BigIcon\n\
+            Exec=AppRun\n\
+            Icon=bigapp\n";
+        w.push_file(Cursor::new(desktop), "bigapp.desktop", hdr)
+            .unwrap();
+        w.push_file(
+            Cursor::new(vec![0u8; 8 * 1024 * 1024 + 1]),
+            "bigapp.png",
+            hdr,
+        )
+        .unwrap();
+        w.push_dir_all("usr/share/icons/hicolor/128x128/apps", hdr)
+            .unwrap();
+        w.push_file(
+            Cursor::new(minimal_256_png()),
+            "usr/share/icons/hicolor/128x128/apps/bigapp.png",
+            hdr,
+        )
+        .unwrap();
+        w.push_symlink("bigapp.png", ".DirIcon", hdr).unwrap();
+    });
+
+    let inspected_big_icon = extractor
+        .inspect_and_extract(&oversized_icon_app, None)
+        .unwrap();
+    assert_eq!(inspected_big_icon.metadata.app_name, "BigIcon");
+    assert_eq!(inspected_big_icon.metadata.icons.len(), 1);
+    assert_eq!(inspected_big_icon.metadata.icons[0].size_dir, "128x128");
+}
